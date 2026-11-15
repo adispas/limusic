@@ -39,6 +39,9 @@ crypt32.dll
 dbghelp.dll
 dwmapi.dll
 gdi32.dll
+# Google Cast: mdns-sd lists the network adapters to browse on (GetAdaptersAddresses). Part of
+# Windows since 2000, and libmpv-2.dll imports it already.
+iphlpapi.dll
 kernel32.dll
 libmpv-2.dll
 ntdll.dll
