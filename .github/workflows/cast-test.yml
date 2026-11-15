@@ -1,0 +1,132 @@
+# Test build of the Cast branch: the Windows installer, on every push to feature/cast, published to
+# the `cast-test` pre-release (Releases → cast-test), replaced by each build.
+#
+# The release build (windows-release.yml) minus what a test build has no use for: no tag, no
+# updater signature (there is no signing key in a fork), no latest.json. The libmpv and VC++ runtime
+# steps are the release's, so the result links and starts like a release does.
+#
+# It is the same app as Limusic (same identifier), so installing it updates an existing Limusic and
+# keeps its library and settings. Don't take the in-app update while testing: that installs the
+# official release, which has no Cast.
+name: Cast test build
+
+on:
+  push:
+    branches: [feature/cast]
+  workflow_dispatch:
+
+permissions:
+  contents: write # to replace the installer on the cast-test pre-release
+
+concurrency:
+  group: cast-test
+  cancel-in-progress: true
+
+env:
+  MPV_DEV_URL: https://github.com/SimoHypers/limusic/releases/download/deps/libmpv-2-x86_64-20260610-git-304426c.7z
+  MPV_DEV_SHA256: af708edcdf6ed12ac7b2bb31b4cbeba0bf7d4eef345a715ef5de782c0ddd6671
+  MPV_DIR: ${{ github.workspace }}\.libmpv
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: ui/pnpm-lock.yaml
+
+      - name: Frontend deps
+        shell: bash
+        run: cd ui && pnpm install --frozen-lockfile
+
+      - name: Rust (MSVC)
+        shell: bash
+        run: rustup default stable-msvc
+
+      - name: RUSTFLAGS (libmpv link path, rust-lld)
+        shell: bash
+        run: |
+          set -euo pipefail
+          FLAGS="-L native=${{ github.workspace }}\.libmpv"
+          SYSROOT="$(rustc --print sysroot | tr '\\' '/')"
+          RUST_LLD="$SYSROOT/lib/rustlib/x86_64-pc-windows-msvc/bin/rust-lld.exe"
+          if [ -f "$RUST_LLD" ]; then FLAGS="$FLAGS -C linker-flavor=lld-link -C linker=$RUST_LLD"; fi
+          echo "RUSTFLAGS=$FLAGS" >> "$GITHUB_ENV"
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: . -> target
+
+      - name: Tauri CLI
+        shell: bash
+        run: npm install -g "@tauri-apps/cli@2.11.5"
+
+      - name: Build the libmpv import library
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          New-Item -ItemType Directory -Force -Path "$env:MPV_DIR" | Out-Null
+          curl.exe -fsSL -o "$env:MPV_DIR\mpv-dev.7z" "$env:MPV_DEV_URL"
+          if ((Get-FileHash "$env:MPV_DIR\mpv-dev.7z" -Algorithm SHA256).Hash -ne $env:MPV_DEV_SHA256) { throw "mpv-dev.7z does not match MPV_DEV_SHA256" }
+          7z x "$env:MPV_DIR\mpv-dev.7z" -o"$env:MPV_DIR" -y | Out-Null
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vs = & $vswhere -latest -products * -property installationPath
+          Import-Module "$vs\Common7\Tools\Microsoft.VisualStudio.DevShell.dll"
+          Enter-VsDevShell -VsInstallPath $vs -SkipAutomaticLocation -DevCmdArguments '-arch=x64 -host_arch=x64'
+          Set-Location "$env:MPV_DIR"
+          $names = & dumpbin /exports libmpv-2.dll |
+            Select-String -Pattern '^\s+\d+\s+[0-9A-Fa-f]+\s+[0-9A-Fa-f]+\s+(\w+)' |
+            ForEach-Object { $_.Matches[0].Groups[1].Value }
+          if ($names.Count -lt 50) { throw "parsed only $($names.Count) exports from libmpv-2.dll" }
+          @("EXPORTS") + ($names | ForEach-Object { "    $_" }) | Set-Content -Path mpv.def -Encoding ascii
+          & lib /def:mpv.def /name:libmpv-2.dll /out:mpv.lib /machine:x64
+          Copy-Item "$env:MPV_DIR\libmpv-2.dll" "$env:GITHUB_WORKSPACE\src-tauri\libmpv-2.dll" -Force
+
+      - name: VC++ runtime (bundled)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vs = & $vswhere -latest -products * -property installationPath
+          $msvc = Join-Path $vs "VC\Redist\MSVC"
+          $defaultTxt = Join-Path $vs "VC\Auxiliary\Build\Microsoft.VCRedistVersion.default.txt"
+          if (Test-Path $defaultTxt) { $redistVersion = (Get-Content -Raw $defaultTxt).Trim() }
+          else { $redistVersion = (Get-ChildItem -Path $msvc -Directory | Where-Object { $_.Name -match '^\d+\.\d+\.\d+' } | Sort-Object { [version]$_.Name } -Descending | Select-Object -First 1).Name }
+          $crt = Get-ChildItem -Directory -Path (Join-Path $msvc "$redistVersion\x64") -Filter 'Microsoft.VC*.CRT' | Sort-Object Name -Descending | Select-Object -First 1
+          New-Item -ItemType Directory -Force -Path "$env:GITHUB_WORKSPACE\src-tauri\vcruntime" | Out-Null
+          foreach ($dll in @('vcruntime140.dll', 'vcruntime140_1.dll', 'msvcp140.dll', 'msvcp140_1.dll')) {
+            Copy-Item (Join-Path $crt.FullName $dll) -Destination "$env:GITHUB_WORKSPACE\src-tauri\vcruntime\$dll" -Force
+          }
+
+      - name: Build the installer
+        shell: bash
+        run: |
+          set -euo pipefail
+          (cd ui && pnpm build)
+          # No updater signature: a fork has no signing key, and this build is never auto-updated to.
+          tauri build --bundles nsis --config '{"build":{"beforeBuildCommand":""},"bundle":{"createUpdaterArtifacts":false}}'
+
+      - name: Import table check
+        shell: pwsh
+        run: ./scripts/check-windows-imports.ps1 -Exe target/release/limusic-app.exe
+
+      - name: Publish to the cast-test pre-release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          cp target/release/bundle/nsis/*-setup.exe Limusic-Cast-test-Windows-Setup.exe
+          NOTES="Test build of the Cast branch (commit ${GITHUB_SHA::7}), replaced by every push to feature/cast. Installing it updates an existing Limusic; don't take the in-app update while testing, it installs the official release without Cast."
+          gh release view cast-test >/dev/null 2>&1 || gh release create cast-test --prerelease --target "$GITHUB_SHA" --title "Cast test build" --notes "$NOTES"
+          gh release upload cast-test Limusic-Cast-test-Windows-Setup.exe --clobber
+          gh release edit cast-test --notes "$NOTES"

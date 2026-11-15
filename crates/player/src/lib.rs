@@ -11,8 +11,40 @@ use std::time::Duration;
 use libmpv2::events::{Event, EventContext, PropertyData};
 use libmpv2::mpv_node::MpvNode;
 use libmpv2::{Format, Mpv};
+use tokio::sync::mpsc::error::SendError;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
+pub use remote::{RemoteHandle, RemoteOutput};
+
+/// The player's event channel, with a mute for when a remote output is attached (`remote.rs`):
+/// mpv is stopped for the handover then, and nothing it reports is about what the user hears.
+#[derive(Clone)]
+struct EventTx {
+    tx: UnboundedSender<PlayerEvent>,
+    muted: Arc<AtomicBool>,
+}
+
+impl EventTx {
+    /// mpv's events. Dropped while muted (still `Err` once the receiver is gone, so the event
+    /// threads stop).
+    fn send(&self, e: PlayerEvent) -> Result<(), SendError<PlayerEvent>> {
+        if self.muted.load(Ordering::SeqCst) {
+            return if self.tx.is_closed() { Err(SendError(e)) } else { Ok(()) };
+        }
+        self.tx.send(e)
+    }
+
+    /// The remote output's events, which are what the user hears while muted.
+    fn send_unmuted(&self, e: PlayerEvent) -> Result<(), SendError<PlayerEvent>> {
+        self.tx.send(e)
+    }
+
+    fn mute(&self, on: bool) {
+        self.muted.store(on, Ordering::SeqCst);
+    }
+}
+
+mod remote;
 mod video;
 pub use video::{GlDisplay, Thumbnail, VideoRenderer};
 
@@ -223,7 +255,11 @@ struct Decks {
     live_url: Mutex<Option<String>>,
     cache_dir: String,
     afir_normalization: OnceLock<&'static str>,
-    tx: UnboundedSender<PlayerEvent>,
+    tx: EventTx,
+    /// A remote output (a Cast device) playing instead of mpv. See `remote.rs`.
+    remote: Mutex<Option<Arc<remote::Remote>>>,
+    /// The headers last handed to mpv, for taking the track to a remote output and back.
+    headers: Mutex<HashMap<String, String>>,
     /// Music videos waiting for (or attached to) the audio file they belong to. See `video.rs`.
     videos: Mutex<video::Videos>,
     /// Someone can see the picture, so the deck being heard decodes it.
@@ -437,7 +473,9 @@ impl Player {
             live_url: Mutex::new(None),
             cache_dir: cache_dir.to_owned(),
             afir_normalization: OnceLock::new(),
-            tx,
+            tx: EventTx { tx, muted: Arc::new(AtomicBool::new(false)) },
+            remote: Mutex::new(None),
+            headers: Mutex::new(HashMap::new()),
             videos: Mutex::new(video::Videos::default()),
             video_visible: AtomicBool::new(false),
             on_new_deck: OnceLock::new(),
@@ -529,6 +567,10 @@ impl Player {
         live: bool,
         file_opts: &[&str],
     ) -> Result<(), Error> {
+        if let Some(r) = self.remote() {
+            // A karaoke WAV still being written is served to the device too (`k` on the LAN).
+            return self.remote_load(&r, url, headers, gain_db, start, live);
+        }
         // Whatever was queued up on the other deck is not what the user asked for. Cut a fade
         // in progress too: a skip during the last seconds of a track should not leave the old one
         // still fading under the new one.
@@ -572,6 +614,10 @@ impl Player {
     /// inherit the currently-set headers. Phase 1 direct-URL clients need no per-track cookies,
     /// so this is fine; per-track header divergence is a Phase 2+ concern (WEB_REMIX `&pot=`).
     pub fn enqueue(&self, url: &str) -> Result<(), Error> {
+        if let Some(r) = self.remote() {
+            self.remote_enqueue(&r, url);
+            return Ok(());
+        }
         if self.decks.crossfade_ms.load(Ordering::Relaxed) == 0 {
             self.mpv().command("loadfile", &[&quoted(url), "append"])?;
             return Ok(());
@@ -646,6 +692,10 @@ impl Player {
 
     /// Clear the mpv playlist (e.g. when the user jumps to a new track).
     pub fn clear_playlist(&self) -> Result<(), Error> {
+        if let Some(r) = self.remote() {
+            self.remote_clear_playlist(&r);
+            return Ok(());
+        }
         self.mpv().command("playlist-clear", &[])?;
         self.drop_preload(false);
         Ok(())
@@ -660,6 +710,10 @@ impl Player {
     /// entry is the current one, so `playlist-clear` would leave it playing, which is a track the
     /// user never asked for starting by itself. Issue #267.
     pub fn stop(&self) -> Result<(), Error> {
+        if let Some(r) = self.remote() {
+            self.remote_stop(&r);
+            return Ok(());
+        }
         self.drop_preload(true);
         self.mpv().command("stop", &[])?;
         Ok(())
@@ -669,15 +723,25 @@ impl Player {
     /// orchestrator uses this after a track ends/fails to tell "gaplessly advanced into the
     /// lookahead" apart from "stalled — load the next track explicitly".
     pub fn is_idle(&self) -> bool {
+        if let Some(r) = self.remote() {
+            return self.remote_is_idle(&r);
+        }
         self.mpv().get_property::<bool>("idle-active").unwrap_or(true)
     }
 
     /// True when mpv is currently paused.
     pub fn is_paused(&self) -> bool {
+        if let Some(r) = self.remote() {
+            return self.remote_is_paused(&r);
+        }
         self.mpv().get_property::<bool>("pause").unwrap_or(false)
     }
 
     pub fn play(&self) -> Result<(), Error> {
+        if let Some(r) = self.remote() {
+            self.remote_set_paused(&r, false);
+            return Ok(());
+        }
         self.mpv().set_property("pause", false)?;
         Ok(())
     }
@@ -687,6 +751,10 @@ impl Player {
     /// silence for the rest of the fade. Every pause in the app comes through here, media keys and
     /// MPRIS included.
     pub fn pause(&self) -> Result<(), Error> {
+        if let Some(r) = self.remote() {
+            self.remote_set_paused(&r, true);
+            return Ok(());
+        }
         self.cancel_fade();
         self.mpv().set_property("pause", true)?;
         Ok(())
@@ -695,6 +763,10 @@ impl Player {
     /// Play/pause. Same reason as [`Self::pause`]: only one deck would answer the cycle. (A fade
     /// can't be running while paused, so this is a no-op on the way back up.)
     pub fn toggle(&self) -> Result<(), Error> {
+        if let Some(r) = self.remote() {
+            self.remote_toggle(&r);
+            return Ok(());
+        }
         self.cancel_fade();
         self.mpv().command("cycle", &["pause"])?;
         Ok(())
@@ -704,6 +776,9 @@ impl Player {
     /// emitting end-file, so the queue logic upstream never advances while this is on — by design.
     pub fn set_loop_file(&self, on: bool) -> Result<(), Error> {
         self.decks.loop_file.store(on, Ordering::Relaxed);
+        if self.is_remote() {
+            return Ok(()); // the remote restarts the track itself (`RemoteHandle::finished`)
+        }
         self.mpv().set_property("loop-file", if on { "inf" } else { "no" })?;
         Ok(())
     }
@@ -722,6 +797,10 @@ impl Player {
     }
 
     pub fn seek(&self, position_secs: f64) -> Result<(), Error> {
+        if let Some(r) = self.remote() {
+            self.remote_seek(&r, position_secs);
+            return Ok(());
+        }
         // A broadcast's timeline is its DVR window, not a track (#424): a position from the UI,
         // a media key or a Listen Together host means nothing in it.
         if self.on_air() {
@@ -746,6 +825,11 @@ impl Player {
     /// onto a 60 dB loudness range instead (see [`perceptual_to_mpv`]), so steps stay roughly
     /// the same size and the bottom of the slider is actually quiet rather than just near-floor.
     pub fn set_volume(&self, volume: i64) -> Result<(), Error> {
+        if let Some(r) = self.remote() {
+            self.decks.volume.store(volume, Ordering::Relaxed);
+            self.remote_set_volume(&r, volume);
+            return Ok(());
+        }
         self.mpv().set_property("volume", perceptual_to_mpv(volume))?;
         // Remembered because a crossfade scales it on both decks, and because the deck that
         // fades in is not the one this was last set on.
@@ -786,6 +870,7 @@ impl Player {
     }
 
     fn apply_headers(&self, headers: &HashMap<String, String>) -> Result<(), Error> {
+        *self.decks.headers.lock().unwrap() = headers.clone();
         // User-Agent has its own mpv property; everything else joins http-header-fields.
         if let Some(ua) = headers.get("User-Agent").or_else(|| headers.get("user-agent")) {
             self.mpv().set_property("user-agent", ua.as_str())?;
@@ -811,6 +896,10 @@ impl Player {
     // round-trip (a few ms) and the filter chain reinits mid-stream. If that ever clicks audibly,
     // keep one labelled filter (`af=@gain:lavfi=[volume=0dB]`) and retune it with `af-command`.
     pub fn set_gain(&self, gain_db: Option<f64>) -> Result<(), Error> {
+        if let Some(r) = self.remote() {
+            self.remote_set_gain(&r, gain_db);
+            return Ok(());
+        }
         let mut af = self.decks.af.lock().unwrap();
         let deck = self.decks.active.load(Ordering::SeqCst);
         let previous = af.gain[deck];
@@ -900,6 +989,9 @@ impl Player {
     /// the null output alike), `audio-pts` strayed 0.1-0.2 ms from a straight line at 1x, 0.75x
     /// and 0.5x, and `time-pos` 85-98 ms at 1x. A read costs about 20 microseconds.
     pub fn clock(&self) -> Option<f64> {
+        if let Some(r) = self.remote() {
+            return self.remote_clock(&r);
+        }
         let mpv = self.mpv();
         mpv.get_property::<f64>("audio-pts").or_else(|_| mpv.get_property::<f64>("time-pos")).ok()
     }

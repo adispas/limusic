@@ -24,7 +24,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::convert::Infallible;
 use std::io;
-use std::net::{Ipv4Addr, TcpListener};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, UdpSocket};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
@@ -88,6 +88,9 @@ struct Meta {
 struct Registration {
     url: String,
     headers: HashMap<String, String>,
+    /// The track it plays, when the caller said (`register_track`): a cast device is shown its
+    /// title and artwork by it.
+    video_id: Option<String>,
     meta: Mutex<Option<Meta>>,
 }
 
@@ -154,6 +157,23 @@ pub fn start() {
 /// kill-switch is set, or the URL is not one of YouTube's stream hosts (an RSS-feed podcast's
 /// enclosure is not throttled, and may not honour ranges, #294).
 pub fn register(url: &str, headers: &HashMap<String, String>) -> Option<String> {
+    register_with(url, headers, None)
+}
+
+/// [`register`], noting which track the stream is.
+pub fn register_track(
+    url: &str,
+    headers: &HashMap<String, String>,
+    video_id: &str,
+) -> Option<String> {
+    register_with(url, headers, Some(video_id.to_owned()))
+}
+
+fn register_with(
+    url: &str,
+    headers: &HashMap<String, String>,
+    video_id: Option<String>,
+) -> Option<String> {
     if !crate::orchestrator::is_youtube_stream(url)
         || std::env::var_os("LIMUSIC_NO_AUDIO_PROXY").is_some()
     {
@@ -164,6 +184,7 @@ pub fn register(url: &str, headers: &HashMap<String, String>) -> Option<String> 
     let reg = Arc::new(Registration {
         url: url.to_owned(),
         headers: headers.clone(),
+        video_id,
         meta: Mutex::new(None),
     });
     {
@@ -320,7 +341,13 @@ async fn handle(req: Request<Incoming>) -> Result<Response<ProxyBody>, StatusCod
     if let Some(("k", id)) = route(req.uri().path(), token) {
         return serve_growing(&req, id).await;
     }
-    let id = id_from(req.uri().path(), token).ok_or(StatusCode::NOT_FOUND)?;
+    let id = id_from(req.uri().path(), token).ok_or(StatusCode::NOT_FOUND)?.to_owned();
+    serve_stream(req, &id).await
+}
+
+/// One registered stream, by its registration id: the part shared by the loopback listener and
+/// the LAN one a cast device streams from.
+async fn serve_stream(req: Request<Incoming>, id: &str) -> Result<Response<ProxyBody>, StatusCode> {
     let reg = {
         let r = REGISTRY
             .get()
@@ -374,6 +401,263 @@ async fn handle(req: Request<Incoming>) -> Result<Response<ProxyBody>, StatusCod
         BodyExt::boxed(StreamBody::new(stream))
     };
     builder.body(body).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+// --- Casting --------------------------------------------------------------------------------
+//
+// A Cast device can't use the loopback URL, and can't fetch googlevideo itself either (the URL is
+// bound to the client that resolved it), so it streams the same registrations from a second
+// listener on this computer's LAN address. That listener answers only `/<lan token>/a/<id>`:
+// registered audio streams, never the karaoke files, with its own token so the loopback one never
+// leaves the machine.
+
+struct Lan {
+    ip: IpAddr,
+    port: u16,
+    token: String,
+    stop: tokio::sync::watch::Sender<bool>,
+}
+
+static LAN: Mutex<Option<Lan>> = Mutex::new(None);
+
+/// This computer's address on the route to `device`: the interface the OS would send from. A UDP
+/// "connect" sends nothing; it only picks the route.
+pub fn address_facing(device: IpAddr) -> Option<IpAddr> {
+    let probe = UdpSocket::bind(if device.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" }).ok()?;
+    probe.connect(SocketAddr::new(device, 8009)).ok()?;
+    let ip = probe.local_addr().ok()?.ip();
+    (!ip.is_unspecified() && !ip.is_loopback()).then_some(ip)
+}
+
+/// The URL a cast device at `device` should play for this loopback URL, starting the LAN listener
+/// (or moving it to another network's address) as needed. `None` for anything but a registered
+/// audio stream, or when there is no route to the device.
+pub fn lan_url(loopback: &str, device: IpAddr) -> Option<String> {
+    let (port, token) = ENDPOINT.get()?;
+    // A registered stream (`a`), or karaoke's instrumental still being written (`k`).
+    let rest = loopback.strip_prefix(&format!("http://127.0.0.1:{port}/{token}/"))?;
+    let (kind, id) = rest.split_once('/').filter(|(k, _)| matches!(*k, "a" | "k"))?;
+    lan_path(device, kind, id)
+}
+
+/// The URL a cast device should play for a file on this computer: local music, or a finished
+/// karaoke instrumental. `None` if it isn't a readable file or there is no route to the device.
+pub fn lan_file_url(path: &str, device: IpAddr) -> Option<String> {
+    let path = std::path::PathBuf::from(path.strip_prefix("file://").unwrap_or(path));
+    if !path.is_file() {
+        return None;
+    }
+    let id = format!("{:016x}", rand::random::<u64>());
+    {
+        let mut files = LAN_FILES.lock().ok()?;
+        if files.len() >= MAX_REGISTRATIONS {
+            files.clear(); // the current and next track are re-registered as they load
+        }
+        files.insert(id.clone(), path);
+    }
+    lan_path(device, "f", &id)
+}
+
+/// Local files a cast device may read, by LAN id.
+static LAN_FILES: std::sync::LazyLock<Mutex<HashMap<String, std::path::PathBuf>>> =
+    std::sync::LazyLock::new(Default::default);
+
+fn lan_path(device: IpAddr, kind: &str, id: &str) -> Option<String> {
+    let ip = address_facing(device)?;
+    let mut lan = LAN.lock().ok()?;
+    if lan.as_ref().map(|l| l.ip) != Some(ip) {
+        if let Some(old) = lan.take() {
+            let _ = old.stop.send(true);
+        }
+        *lan = Some(start_lan(ip)?);
+    }
+    let l = lan.as_ref()?;
+    let host = match l.ip {
+        IpAddr::V4(v4) => v4.to_string(),
+        IpAddr::V6(v6) => format!("[{v6}]"),
+    };
+    Some(format!("http://{host}:{}/{}/{kind}/{id}", l.port, l.token))
+}
+
+/// Close the LAN listener (casting stopped). Connections already streaming finish on their own.
+pub fn stop_lan() {
+    if let Some(old) = LAN.lock().ok().and_then(|mut l| l.take()) {
+        let _ = old.stop.send(true);
+    }
+}
+
+/// The track a loopback URL was registered for, if [`register_track`] said.
+pub fn video_id_of(loopback: &str) -> Option<String> {
+    let (port, token) = ENDPOINT.get()?;
+    let id = loopback.strip_prefix(&format!("http://127.0.0.1:{port}/{token}/a/"))?;
+    REGISTRY.get()?.lock().ok()?.map.get(id)?.video_id.clone()
+}
+
+/// Content type of a registered stream (probing upstream once, like the first mpv request would):
+/// what the cast device must be told before it fetches a byte.
+pub async fn stream_content_type(loopback: &str) -> Option<String> {
+    let (port, token) = ENDPOINT.get()?;
+    if loopback.starts_with(&format!("http://127.0.0.1:{port}/{token}/k/")) {
+        return Some("audio/wav".to_owned());
+    }
+    let id = loopback.strip_prefix(&format!("http://127.0.0.1:{port}/{token}/a/"))?;
+    let reg = REGISTRY.get()?.lock().ok()?.map.get(id).cloned()?;
+    meta_for(&reg).await.ok()?.content_type
+}
+
+fn start_lan(ip: IpAddr) -> Option<Lan> {
+    let listener = match TcpListener::bind((ip, 0)) {
+        Ok(l) => l,
+        Err(e) => {
+            tracing::warn!(error = %e, %ip, "cast: LAN listener bind failed");
+            return None;
+        }
+    };
+    let port = listener.local_addr().ok()?.port();
+    listener.set_nonblocking(true).ok()?;
+    let token = format!("{:016x}{:016x}", rand::random::<u64>(), rand::random::<u64>());
+    let (stop, mut stopped) = tokio::sync::watch::channel(false);
+    let lan_token = token.clone();
+    tracing::info!(%ip, port, "cast: serving audio on the LAN");
+    tauri::async_runtime::spawn(async move {
+        let Ok(listener) = tokio::net::TcpListener::from_std(listener) else { return };
+        loop {
+            let (stream, _) = tokio::select! {
+                r = listener.accept() => match r {
+                    Ok(v) => v,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "cast: LAN accept failed");
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                        continue;
+                    }
+                },
+                _ = stopped.changed() => return,
+            };
+            let token = lan_token.clone();
+            tauri::async_runtime::spawn(async move {
+                let svc = service_fn(move |req| {
+                    let token = token.clone();
+                    async move {
+                        Ok::<_, Infallible>(handle_lan(req, &token).await.unwrap_or_else(empty))
+                    }
+                });
+                let _ = http1::Builder::new()
+                    .timer(TokioTimer::new())
+                    .header_read_timeout(Duration::from_secs(15))
+                    .serve_connection(TokioIo::new(stream), svc)
+                    .await;
+            });
+        }
+    });
+    Some(Lan { ip, port, token, stop })
+}
+
+async fn handle_lan(
+    req: Request<Incoming>,
+    token: &str,
+) -> Result<Response<ProxyBody>, StatusCode> {
+    if !matches!(*req.method(), Method::GET | Method::HEAD) {
+        return Err(StatusCode::METHOD_NOT_ALLOWED);
+    }
+    let (kind, id) = route(req.uri().path(), token).ok_or(StatusCode::NOT_FOUND)?;
+    let (kind, id) = (kind.to_owned(), id.to_owned());
+    let mut resp = match kind.as_str() {
+        "a" => serve_stream(req, &id).await?,
+        "k" => serve_growing(&req, &id).await?,
+        "f" => serve_file(&req, &id).await?,
+        _ => return Err(StatusCode::NOT_FOUND),
+    };
+    // The Default Media Receiver plays a plain file through an <audio> element, which needs no
+    // CORS; a receiver that reads it through Media Source Extensions does.
+    resp.headers_mut()
+        .insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, header::HeaderValue::from_static("*"));
+    Ok(resp)
+}
+
+/// A local file for a cast device, with ranges (it seeks by asking for one).
+async fn serve_file(req: &Request<Incoming>, id: &str) -> Result<Response<ProxyBody>, StatusCode> {
+    use tokio::io::{AsyncReadExt, AsyncSeekExt};
+    let path =
+        LAN_FILES.lock().ok().and_then(|f| f.get(id).cloned()).ok_or(StatusCode::NOT_FOUND)?;
+    let mut file = tokio::fs::File::open(&path).await.map_err(|_| StatusCode::NOT_FOUND)?;
+    let total = file.metadata().await.map_err(|_| StatusCode::NOT_FOUND)?.len();
+    let want = parse_range(req.headers().get(header::RANGE).and_then(|v| v.to_str().ok()));
+    let Some((start, end)) = resolve_window(want, total) else {
+        let mut r = empty(StatusCode::RANGE_NOT_SATISFIABLE);
+        if let Ok(v) = format!("bytes */{total}").parse() {
+            r.headers_mut().insert(header::CONTENT_RANGE, v);
+        }
+        return Ok(r);
+    };
+    let ranged = !matches!(want, Want::Full);
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or_default().to_ascii_lowercase();
+    let content_type = match ext.as_str() {
+        "mp3" => "audio/mpeg",
+        "m4a" | "mp4" | "aac" | "alac" => "audio/mp4",
+        "flac" => "audio/flac",
+        "ogg" | "oga" | "opus" => "audio/ogg",
+        "webm" => "audio/webm",
+        "wav" => "audio/wav",
+        _ => "application/octet-stream",
+    };
+    let mut builder = Response::builder()
+        .status(if ranged { StatusCode::PARTIAL_CONTENT } else { StatusCode::OK }.as_u16())
+        .header(header::ACCEPT_RANGES, "bytes")
+        .header(header::CONTENT_LENGTH, end - start + 1)
+        .header(header::CONTENT_TYPE, content_type);
+    if ranged {
+        builder = builder.header(header::CONTENT_RANGE, format!("bytes {start}-{end}/{total}"));
+    }
+    let body = if req.method() == Method::HEAD {
+        Empty::<Bytes>::new().map_err(|e| match e {}).boxed()
+    } else {
+        file.seek(io::SeekFrom::Start(start))
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        let (tx, rx) = mpsc::channel::<Result<Bytes, io::Error>>(8);
+        tauri::async_runtime::spawn(async move {
+            let mut left = end - start + 1;
+            let mut buf = vec![0u8; 64 * 1024];
+            while left > 0 {
+                let want = buf.len().min(left as usize);
+                match file.read(&mut buf[..want]).await {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        left -= n as u64;
+                        if tx.send(Ok(Bytes::copy_from_slice(&buf[..n]))).await.is_err() {
+                            break; // the device hung up (a seek, the next track)
+                        }
+                    }
+                    Err(e) => {
+                        let _ = tx.send(Err(e)).await;
+                        break;
+                    }
+                }
+            }
+        });
+        let stream = futures_util::stream::unfold(rx, |mut rx| async move {
+            rx.recv().await.map(|item| (item.map(Frame::data), rx))
+        });
+        BodyExt::boxed(StreamBody::new(stream))
+    };
+    builder.body(body).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+/// Content type of a local file, as [`serve_file`] will send it.
+pub fn file_content_type(path: &str) -> &'static str {
+    let ext = std::path::Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    match ext.as_str() {
+        "mp3" => "audio/mpeg",
+        "m4a" | "mp4" | "aac" | "alac" => "audio/mp4",
+        "flac" => "audio/flac",
+        "ogg" | "oga" | "opus" => "audio/ogg",
+        "webm" => "audio/webm",
+        _ => "audio/wav",
+    }
 }
 
 /// The cached [`Meta`], probing upstream once per registration if nothing has learned it yet.
@@ -560,6 +844,46 @@ fn resolve_window(want: Want, total: u64) -> Option<(u64, u64)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What a cast device sees of a local file: the LAN listener, a range, and nothing without
+    /// the token.
+    #[test]
+    fn local_files_reach_a_cast_device_with_ranges() {
+        // Any routable address: the LAN listener binds the interface on the route to it.
+        let device: IpAddr = "192.0.2.50".parse().unwrap();
+        if address_facing(device).is_none() {
+            eprintln!("no network route here, skipping");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("song.flac");
+        let bytes: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
+        std::fs::write(&path, &bytes).unwrap();
+
+        tauri::async_runtime::block_on(async {
+            let url = lan_file_url(path.to_str().unwrap(), device).expect("LAN url");
+            assert!(url.contains("/f/") && !url.contains("127.0.0.1"), "{url}");
+            assert_eq!(file_content_type(path.to_str().unwrap()), "audio/flac");
+            let client = reqwest::Client::builder().no_proxy().build().unwrap();
+
+            let r = client.get(&url).header("Range", "bytes=1000-1999").send().await.unwrap();
+            assert_eq!(r.status(), 206);
+            assert_eq!(r.headers()["content-range"], "bytes 1000-1999/200000");
+            assert_eq!(r.headers()["content-type"], "audio/flac");
+            assert_eq!(r.headers()["access-control-allow-origin"], "*");
+            assert_eq!(r.bytes().await.unwrap().as_ref(), &bytes[1000..2000]);
+
+            let whole = client.get(&url).send().await.unwrap();
+            assert_eq!(whole.status(), 200);
+            assert_eq!(whole.bytes().await.unwrap().len(), bytes.len());
+
+            let (base, id) = url.rsplit_once("/f/").unwrap();
+            let (host, _) = base.rsplit_once('/').unwrap();
+            let wrong = client.get(format!("{host}/nope/f/{id}")).send().await.unwrap();
+            assert_eq!(wrong.status(), 404);
+            stop_lan();
+        });
+    }
 
     #[test]
     fn only_the_right_token_and_kind_route() {

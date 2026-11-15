@@ -2692,6 +2692,18 @@ impl AppState {
         tracing::debug!(index = next_idx, "gapless lookahead primed");
     }
 
+    /// Title, artists, album and artwork of a track in the queue, for a cast device to show.
+    pub async fn cast_metadata(
+        &self,
+        video_id: &str,
+    ) -> Option<(String, String, Option<String>, Option<String>)> {
+        let q = self.queue.lock().await;
+        q.items
+            .iter()
+            .find(|s| s.video_id == video_id)
+            .map(|s| (s.title.clone(), s.artists.clone(), s.album.clone(), s.thumbnail.clone()))
+    }
+
     async fn current_item(&self) -> Option<SongItem> {
         let q = self.queue.lock().await;
         q.items.get(q.current).cloned()
@@ -6491,7 +6503,9 @@ fn mpv_stream_url(data: &PlaybackData) -> String {
     }
     let http = data.stream_url.starts_with("http://") || data.stream_url.starts_with("https://");
     if http {
-        if let Some(url) = crate::audioproxy::register(&data.stream_url, &data.headers) {
+        if let Some(url) =
+            crate::audioproxy::register_track(&data.stream_url, &data.headers, &data.video_id)
+        {
             return url;
         }
     }

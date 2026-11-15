@@ -75,6 +75,9 @@ impl Player {
 
     /// The file mpv is playing, exactly as it was handed it.
     pub fn current_path(&self) -> Option<String> {
+        if let Some(r) = self.remote() {
+            return self.remote_current_path(&r);
+        }
         self.mpv().get_property::<String>("path").ok()
     }
 
