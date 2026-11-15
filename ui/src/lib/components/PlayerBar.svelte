@@ -49,6 +49,7 @@
 	import SpeedPicker from './SpeedPicker.svelte';
 	import TrackMenu from './TrackMenu.svelte';
 	import DevicePicker from './DevicePicker.svelte';
+	import CastPicker from './CastPicker.svelte';
 	import { link } from '$lib/link.svelte';
 	import { currentLocale, t } from '$lib/i18n.svelte';
 	import LiveBadge from './LiveBadge.svelte';
@@ -467,6 +468,8 @@
 		<!-- One cluster, so they sit tighter to each other than to the volume slider. -->
 		<div class="flex items-center gap-0.5">
 			{#if link.status !== 'off'}<DevicePicker />{/if}
+			<!-- Casting moves this desktop's playback, so not while the bar is a linked device's remote. -->
+			{#if !link.remote}<CastPicker />{/if}
 			<!-- Speed, pitch and reverb are this desktop's player's; hidden while it controls a linked device. -->
 			{#if !link.remote}
 			<Button

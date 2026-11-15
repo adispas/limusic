@@ -3,6 +3,7 @@
 mod appicon;
 mod audioproxy;
 mod blocked;
+mod cast;
 mod cipher;
 mod commands;
 mod db;
@@ -1069,6 +1070,7 @@ pub fn run() {
                 lastfm,
             ));
             app.manage(app_state.clone());
+            app.manage(cast::Cast::new(app.handle().clone()));
 
             // The player view's <video> pulls its bytes from Rust over loopback, so the webview
             // never sees a googlevideo URL (context/11). videoproxy.rs explains why a socket and
@@ -1330,6 +1332,10 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(only_ui(tauri::generate_handler![
+            cast::cast_discover,
+            cast::cast_status,
+            cast::cast_connect,
+            cast::cast_disconnect,
             commands::set_webview_opaque,
             commands::search,
             commands::search_all,
@@ -1593,6 +1599,9 @@ pub fn run() {
             if let tauri::RunEvent::Exit = &event {
                 if let Some(state) = handle.try_state::<Arc<AppState>>() {
                     state.flush_position();
+                }
+                if let Some(cast) = handle.try_state::<Arc<cast::Cast>>() {
+                    cast.shutdown();
                 }
                 mini::save_position(handle);
             }

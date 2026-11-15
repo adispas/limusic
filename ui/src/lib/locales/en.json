@@ -255,6 +255,24 @@
 		"stats": "Stats",
 		"no_channels": "YouTube did not return any selectable channels."
 	},
+	"cast": {
+		"cast": "Cast",
+		"title": "Cast to",
+		"hint": "Play on a speaker or a TV on your Wi-Fi.",
+		"casting_to": "Casting to {name}",
+		"searching": "Looking for speakers and TVs on your Wi-Fi…",
+		"none_found": "Nothing found. Check that the speaker or TV is on and on the same Wi-Fi as this computer.",
+		"connecting": "Connecting…",
+		"connected": "Playing here",
+		"stop": "Stop casting and play here",
+		"audio_only": "Casting plays the audio. Tempo, pitch, reverb and crossfade stay on this computer.",
+		"could_not_connect": "Couldn't connect to {name}. {reason}",
+		"errors": {
+			"lost": "Lost the connection to the cast device. Playing here again, paused.",
+			"takenOver": "Another app started playing on the cast device. Playing here again, paused.",
+			"noNetwork": "Couldn't find this computer on the same network as the device."
+		}
+	},
 	"player": {
 		"link_playing_on": "Playing on {name}",
 		"link_paused_on": "Paused on {name}",

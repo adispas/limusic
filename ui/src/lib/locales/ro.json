@@ -91,6 +91,24 @@
 		"no_channels": "YouTube nu a returnat niciun canal selectabil.",
 		"stats": "Statistici"
 	},
+	"cast": {
+		"cast": "Transmite",
+		"title": "Transmite pe",
+		"hint": "Redă pe o boxă sau un televizor din rețeaua ta Wi-Fi.",
+		"casting_to": "Se transmite pe {name}",
+		"searching": "Se caută boxe și televizoare în rețeaua Wi-Fi…",
+		"none_found": "Nu s-a găsit nimic. Verifică dacă boxa sau televizorul e pornit și în aceeași rețea Wi-Fi cu acest computer.",
+		"connecting": "Se conectează…",
+		"connected": "Redă aici",
+		"stop": "Oprește transmiterea și redă aici",
+		"audio_only": "Se transmite doar sunetul. Tempo, înălțimea, reverb și crossfade rămân pe acest computer.",
+		"could_not_connect": "Nu s-a putut conecta la {name}. {reason}",
+		"errors": {
+			"lost": "S-a pierdut conexiunea cu dispozitivul. Redarea revine aici, pe pauză.",
+			"takenOver": "O altă aplicație a început să redea pe dispozitiv. Redarea revine aici, pe pauză.",
+			"noNetwork": "Acest computer nu e în aceeași rețea cu dispozitivul."
+		}
+	},
 	"player": {
 		"play": "Redă",
 		"pause": "Pauză",
