@@ -161,25 +161,7 @@ impl Cast {
         }
 
         let (channel, inbox) = Channel::open(device.addr).await?;
-        let status = channel
-            .request(RECEIVER, NS_RECEIVER, json!({"type": "GET_STATUS"}), Duration::from_secs(10))
-            .await?
-            .data;
-        let mut app = find_app(&status["status"]);
-        if app.is_none() {
-            let reply = channel
-                .request(
-                    RECEIVER,
-                    NS_RECEIVER,
-                    json!({"type": "LAUNCH", "appId": DEFAULT_MEDIA_RECEIVER}),
-                    Duration::from_secs(20),
-                )
-                .await?
-                .data;
-            app = find_app(&reply["status"]);
-        }
-        let (session_id, transport) =
-            app.ok_or_else(|| anyhow::anyhow!("The device didn't start the player."))?;
+        let (session_id, transport) = take_over(&channel).await?;
         channel.send(&transport, NS_CONNECTION, json!({"type": "CONNECT"}));
         if crate::audioproxy::address_facing(device.addr.ip()).is_none() {
             channel.send(RECEIVER, NS_RECEIVER, json!({"type": "STOP", "sessionId": session_id}));
@@ -209,6 +191,7 @@ impl Cast {
             loading: false,
             finished_for: None,
             clock: Clock::default(),
+            seen_ours: false,
         };
         tauri::async_runtime::spawn(task.run(inbox, rx));
         self.emit_session();
@@ -245,6 +228,44 @@ impl Cast {
             let _ = s.tx.send(Cmd::Close);
         }
     }
+}
+
+/// Starts a player of our own on the device, whatever is playing there: picking a device in
+/// Limusic takes it over. Launching the Default Media Receiver closes any other app (Spotify,
+/// YouTube Music, an Assistant timer's chime). If the Default Media Receiver is already running
+/// for another sender (a phone, a browser tab), it is stopped first: launching it again would
+/// only join that sender's session, which could keep playing its own things.
+async fn take_over(channel: &Channel) -> anyhow::Result<(String, String)> {
+    let ask = |data: Value, secs: u64| {
+        channel.request(RECEIVER, NS_RECEIVER, data, Duration::from_secs(secs))
+    };
+    let status = ask(json!({"type": "GET_STATUS"}), 10).await?.data;
+    for app in status["status"]["applications"].as_array().into_iter().flatten() {
+        if app["appId"] == DEFAULT_MEDIA_RECEIVER {
+            if let Some(session) = app["sessionId"].as_str() {
+                tracing::info!("cast: stopping the media player another sender was using");
+                let _ = ask(json!({"type": "STOP", "sessionId": session}), 10).await;
+            }
+        } else if app["isIdleScreen"] != true {
+            tracing::info!(app = %app["displayName"], "cast: taking the device over");
+        }
+    }
+    let previous = find_app(&status["status"]).map(|(session, _)| session);
+    let reply = ask(json!({"type": "LAUNCH", "appId": DEFAULT_MEDIA_RECEIVER}), 20).await?.data;
+    let fresh =
+        |status: &Value| find_app(status).filter(|(session, _)| Some(session) != previous.as_ref());
+    if let Some(app) = fresh(&reply["status"]) {
+        return Ok(app);
+    }
+    // Some devices answer the launch before the player is up: ask until it is, for a while.
+    for _ in 0..30 {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let status = ask(json!({"type": "GET_STATUS"}), 5).await?.data;
+        if let Some(app) = fresh(&status["status"]) {
+            return Ok(app);
+        }
+    }
+    anyhow::bail!("The device didn't start the player.")
 }
 
 fn find_app(status: &Value) -> Option<(String, String)> {
@@ -294,6 +315,9 @@ struct SessionTask {
     /// The media session already reported finished (the device repeats an idle status).
     finished_for: Option<i64>,
     clock: Clock,
+    /// The device has reported our player running. Statuses before that are about the app the
+    /// launch closed (or the previous media player stopping), not about someone taking over.
+    seen_ours: bool,
 }
 
 impl SessionTask {
@@ -479,8 +503,10 @@ impl SessionTask {
             let ours = m.data["status"]["applications"].as_array().is_some_and(|apps| {
                 apps.iter().any(|a| a["sessionId"] == self.session_id.as_str())
             });
-            if !ours {
-                // Someone cast something else, or stopped it from the Google Home app.
+            if ours {
+                self.seen_ours = true;
+            } else if self.seen_ours {
+                // Someone cast something else since, or stopped it from the Google Home app.
                 self.lost("takenOver");
             }
             return;
